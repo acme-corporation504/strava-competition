@@ -1,18 +1,18 @@
 import requests
-import datetime
+# import datetime
+from datetime import timedelta, datetime
 import time
 from dotenv import load_dotenv
 import os
 import json
 import pandas as pd
+import math
 
 
 # --- CONFIGURATION ---
 load_dotenv()
 CLIENT_ID = os.getenv("CLIENT_ID")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET")
-# REFRESH_TOKEN = "3b999a2c25db6d10fe00328899d2ccde78e1394e"
-# AUTHORIZATION_CODE = "c3715acee0c39a6c14725258791f616fc5bebe76"
 TOKEN_FILE = "tokens.json"
 CSV_FILE = "strava_segment_times.csv"
 TOKEN_URL = "https://www.strava.com/oauth/token"
@@ -35,6 +35,31 @@ def save_athlete_tokens(tokens_dict):
         json.dump(tokens_dict, f, indent=4)
 
 
+def get_initial_tokens(client_id, client_secret, code):
+    """Exchanges the authorization code for access and refresh tokens."""
+    payload = {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "code": code,
+        "grant_type": "authorization_code",
+    }
+    response = requests.post(TOKEN_URL, data=payload)
+    print(response.json())
+    try:
+        data = response.json()
+        print(data.get('scope', ''))
+        if 'activity:read' not in data.get('scope', '') and 'activity:read_all' not in data.get('scope', ''):
+            print("❌ ERROR: Your refresh token does not have 'activity:read' or 'activity:read_all' scopes!")
+            print("Go back to the browser OAuth step and include &scope=activity:read_all")
+            exit()
+    except ValueError:
+        print("Failed to parse token exchange response as JSON:")
+        print(response.text)
+        return None
+
+    return data.get("access_token"), data.get("refresh_token")
+
+
 def get_access_token(client_id, client_secret, refresh_token):
     """Refreshes the expired access token."""
     payload = {
@@ -46,6 +71,7 @@ def get_access_token(client_id, client_secret, refresh_token):
     response = requests.post(TOKEN_URL, data=payload)
     try:
         data = response.json()
+        print(f"scope: {data.get('scope', '')}")
     except ValueError:
         print("Failed to parse token refresh response as JSON:")
         print(response.text)
@@ -90,8 +116,8 @@ def get_authenticated_athlete_efforts_by_date(access_token, segment_id, target_d
     headers = {"Authorization": f"Bearer {access_token}"}
 
     # Convert the target date into proper ISO 8601 strings
-    start_date = datetime.datetime.strptime(target_date_str, "%Y-%m-%d")
-    end_date = start_date + datetime.timedelta(days=1)
+    start_date = datetime.strptime(target_date_str, "%Y-%m-%d")
+    end_date = start_date + timedelta(days=1)
 
     params = {
         "segment_id": segment_id,
@@ -110,15 +136,6 @@ def get_authenticated_athlete_efforts_by_date(access_token, segment_id, target_d
     if not efforts:
         print(f"No efforts found on Segment {segment_id} on {target_date_str}.")
         return []
-
-    # print(efforts)
-    # print(f"Found {len(efforts)} effort(s) on {target_date_str}:")
-    # for effort in efforts:
-    #     print(f"- Effort ID: {effort['id']}")
-    #     print(f"  Moving Time: {effort['moving_time']} seconds")
-    #     print(f"  Elapsed Time: {effort['elapsed_time']} seconds")
-    #     print(f"  Activity ID: {effort['activity']['id']}")
-    #     print("---")
 
     return efforts
 
@@ -153,17 +170,82 @@ def append_to_csv_with_pandas(results_list):
     print(f"[System] Successfully sorted and saved to {CSV_FILE}")
 
 
+def haversine_distance(lat1, lon1, lat2, lon2):
+    """Calculate the great-circle distance between two points in meters."""
+    # Convert decimal degrees to radians
+    lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
+    
+    # Haversine formula
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
+    c = 2 * math.asin(math.sqrt(a))
+    
+    # Radius of Earth in meters
+    r = 6371000 
+    return c * r
+
+def get_arrival_time(access_token, activity_id, target_lat, target_lng):
+
+    headers = {
+        "Authorization": f"Bearer {access_token}"
+    }
+    activity_res = requests.get(f"https://www.strava.com/api/v3/activities/{activity_id}", headers=headers).json()
+    
+    if 'start_date_local' not in activity_res:
+        raise Exception(f"Error fetching activity: {activity_res.get('message', 'Unknown error')}")
+        
+    start_time_str = activity_res['start_date_local']  # Example: "2026-05-20T08:00:00Z"
+    start_time = datetime.strptime(start_time_str, "%Y-%m-%dT%H:%M:%SZ")
+    
+    # 2. Fetch the latlng and time streams
+    streams_url = f"https://www.strava.com/api/v3/activities/{activity_id}/streams"
+    params = {'keys': 'latlng,time', 'key_by_type': 'true'}
+    streams_res = requests.get(streams_url, headers=headers, params=params).json()
+    
+    latlng_data = streams_res.get('latlng', {}).get('data', [])
+    time_data = streams_res.get('time', {}).get('data', [])
+    
+    if not latlng_data or not time_data:
+        raise Exception("Could not retrieve stream data for this activity.")
+
+    # 3. Find the index of the closest coordinate
+    min_distance = float('inf')
+    closest_index = -1
+    
+    # what happens if there are multiple points with the same minimum distance? In that case, we will take the first one we encounter (the earliest in the activity). This is a reasonable approach since we want to know the arrival time at the target location, and if multiple points are equidistant, the first one would represent the initial arrival.
+    for idx, coord in enumerate(latlng_data):
+        distance = haversine_distance(target_lat, target_lng, coord[0], coord[1])
+        if distance < min_distance:
+            min_distance = distance
+            closest_index = idx
+            
+    # 4. Calculate the absolute arrival timestamp
+    elapsed_seconds = time_data[closest_index]
+    arrival_time = start_time + timedelta(seconds=elapsed_seconds)
+    
+    return {
+        "arrival_time_unix_timestamp": int(arrival_time.timestamp()),
+        "arrival_time": arrival_time.strftime("%Y-%m-%d %H:%M:%S"),
+        "distance_to_target_meters": round(min_distance, 2),
+        "elapsed_seconds": elapsed_seconds
+    }
+
 def main():
     refresh_token_check = False
-    TARGET_DATE = "2026-05-15"
+    TARGET_DATE = "2026-05-22"
     ATHLETE_TOKENS = load_athlete_tokens()
+    print(ATHLETE_TOKENS)
 
     all_runs_data = []
     for TARGET_ATHLETE_ID_str, ref_token in ATHLETE_TOKENS.items():
         TARGET_ATHLETE_ID = int(TARGET_ATHLETE_ID_str)
+        athlete_name = athlete[TARGET_ATHLETE_ID]
         print(f"\n{athlete[TARGET_ATHLETE_ID]} - Refreshing access token...")
-
+        # access_token, refresh_token  = get_initial_tokens(CLIENT_ID, CLIENT_SECRET, "0e43f52e71d1b81b0b6957cc3ec05339583a6fcf")
+        
         access_token, refresh_token  = get_access_token(CLIENT_ID, CLIENT_SECRET, ref_token)
+        print(f"access token {access_token}, refresh token {refresh_token}")
         if ATHLETE_TOKENS[str(TARGET_ATHLETE_ID)] != refresh_token:
             ATHLETE_TOKENS[str(TARGET_ATHLETE_ID)] = refresh_token  # Update with new refresh token (this is only necessary because of temp refresh tokens)
             refresh_token_check = True
@@ -171,7 +253,7 @@ def main():
             efforts = get_authenticated_athlete_efforts_by_date(access_token, TARGET_SEGMENT_ID, TARGET_DATE)
             # print(efforts)
             for effort in efforts:
-                name = effort.get("name")
+                name = effort.get("name")             
                 elapsed_time = effort.get("elapsed_time")
                 start_date = effort.get("start_date_local")
 
@@ -184,7 +266,7 @@ def main():
                 )
 
                 athlete_data = {
-                    "Athlete Name": athlete[TARGET_ATHLETE_ID],
+                    "Athlete Name": athlete_name,
                     "Date": TARGET_DATE,
                     "Segment ID": TARGET_SEGMENT_ID,
                     "Segment Name": name,
@@ -194,6 +276,23 @@ def main():
 
                 all_runs_data.append(athlete_data)
                 time.sleep(0.5)
+        
+        activity_id = effort.get("activity").get("id")
+        print(f"Fetching arrival time for {athlete_name} (Activity ID: {activity_id})...")
+        gps_dict = {
+            "colborne and queensway": (43.639658, -79.459587),  # 
+            "gears mississauga": (43.548647, -79.590383), # gears mississauga
+            "town sign toronto": (43.589353, -79.545938), # town sign toronto  
+        }
+        for location_name, (lat, lng) in gps_dict.items():
+            # print(f"Calculating arrival time at {location_name} (Lat: {lat}, Lng: {lng})...")
+            arrival_info = get_arrival_time(access_token, activity_id, lat, lng)
+            print(f"Arrival info for {location_name}: {arrival_info['arrival_time']} (Unix Timestamp: {arrival_info['arrival_time_unix_timestamp']})")
+        # (43.639658, -79.459587) colborne and queensway
+        # (43.548647, -79.590383) gears mississauga
+        # (43.589353, -79.545938) town sign toronto
+        # arrival_info = get_arrival_time(access_token, activity_id, 43.639658, -79.459587)
+        # print(arrival_info)
 
     if refresh_token_check:
         save_athlete_tokens(ATHLETE_TOKENS)
@@ -204,7 +303,8 @@ if __name__ == "__main__":
     main()
 
     
-
+# curl -X GET "https://strava.com" \
+#      -H "Authorization: Bearer [NEW_ACCESS_TOKEN]"
 
 '''
 curl -X POST https://strava.com \
@@ -215,6 +315,6 @@ curl -X POST https://strava.com \
 
 
 this is for getting the initial access and refresh tokens. You only need to do this once per athlete (or whenever you need to generate new tokens). After you have the refresh token, you can use it to get new access tokens without needing to go through the authorization code flow again.
-https://www.strava.com/oauth/authorize?client_id=245963&response_type=code&redirect_uri=http://localhost&approval_prompt=force&scope=read_all
+https://www.strava.com/oauth/authorize?client_id=245963&response_type=code&redirect_uri=http://localhost&approval_prompt=force&scope=read,activity:read,activity:read_all,read_all
 '''
 

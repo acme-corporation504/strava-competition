@@ -8,6 +8,7 @@
 ### usage
 - need to get refresh tokens from each user
 - users authenticate using the following site: https://www.strava.com/oauth/authorize?client_id=245963&response_type=code&redirect_uri=http://localhost&approval_prompt=force&scope=read_all
+https://www.strava.com/oauth/authorize?client_id=245963&response_type=code&redirect_uri=http://localhost&approval_prompt=force&scope=activity:read_all
 - will lead users to an authentication page
 - once authenticated, will take the user to a broken page
 - extract the link from the broken page (should look like: http://localhost/?state=&code=a1b2c3d4e5f6g7h8i9j0...&scope=read,activity:read_all)

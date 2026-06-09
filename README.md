@@ -4,6 +4,8 @@
 
 **To Do**
 - find better way to store refresh tokens (done - store as json)
+- some confusion about how initial token to final refresh token (clarify)
+- calculate elapsed time from leaving colborne and queensway to the gears?
 
 ### usage
 - need to get refresh tokens from each user
@@ -38,3 +40,7 @@ nano .gitignore
 .env
 tokens.json
 ```
+
+https://www.strava.com/oauth/authorize?client_id=245963&response_type=code&redirect_uri=http://localhost&approval_prompt=force&scope=activity:read_all
+
+https://www.strava.com/oauth/authorize?client_id=245963&response_type=code&redirect_uri=http://localhost&approval_prompt=force&scope=read,read_all,activity:read_all
